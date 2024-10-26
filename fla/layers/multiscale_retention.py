@@ -78,6 +78,7 @@ class MultiScaleRetention(nn.Module):
         norm_eps: float = 1e-5,
         fuse_norm: bool = True,
         layer_idx: int = None,
+        vision: bool = False,
         **kwargs
     ) -> MultiScaleRetention:
         super().__init__()
@@ -101,6 +102,8 @@ class MultiScaleRetention(nn.Module):
         self.key_dim_per_group = self.key_dim // self.num_kv_groups
         self.value_dim_per_group = self.value_dim // self.num_kv_groups
         self.layer_idx = layer_idx
+
+        self.vision = vision
 
         assert mode in ['chunk', 'fused_chunk', 'parallel', 'fused_recurrent'], f"Not suppoerted mode `{mode}`."
         assert self.key_dim % num_heads == 0, f"key dim must be divisible by num_heads of {num_heads}"

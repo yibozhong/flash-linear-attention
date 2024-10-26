@@ -13,7 +13,7 @@ from fla.models.linear_attn import (LinearAttentionConfig,
 from fla.models.mamba import MambaConfig, MambaForCausalLM, MambaModel
 from fla.models.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
 from fla.models.retnet import RetNetConfig, RetNetForCausalLM, RetNetModel
-from fla.models.rwkv6 import RWKV6Config, RWKV6ForCausalLM, RWKV6Model
+from fla.models.rwkv6 import RWKV6Config, RWKV6ForCausalLM, RWKV6Model, RWKV6ForImageClassification
 from fla.models.samba import SambaConfig, SambaForCausalLM, SambaModel
 from fla.models.transformer import (TransformerConfig, TransformerForCausalLM,
                                     TransformerModel)
@@ -29,7 +29,7 @@ __all__ = [
     'MambaConfig', 'MambaForCausalLM', 'MambaModel',
     'Mamba2Config', 'Mamba2ForCausalLM', 'Mamba2Model',
     'RetNetConfig', 'RetNetForCausalLM', 'RetNetModel',
-    'RWKV6Config', 'RWKV6ForCausalLM', 'RWKV6Model',
+    'RWKV6Config', 'RWKV6ForCausalLM', 'RWKV6Model', 'RWKV6ForImageClassification',
     'SambaConfig', 'SambaForCausalLM', 'SambaModel',
     'TransformerConfig', 'TransformerForCausalLM', 'TransformerModel'
 ]

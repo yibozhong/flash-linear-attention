@@ -20,6 +20,12 @@ from fla.models.utils import Cache
 from fla.modules import (FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss,
                          LayerNorm)
 from fla.modules.activations import ACT2FN
+from fla.models.utils import CrossScan, CrossMerge
+
+from typing import OrderedDict
+from fla.models.utils import Permute, VisionEmbeddings, PatchEmbeddings, cross_scan_fn, cross_merge_fn
+# import permute
+import einops
 
 logger = logging.get_logger(__name__)
 
@@ -90,6 +96,7 @@ class RWKV6Block(nn.Module):
 
         self.config = config
         self.layer_idx = layer_idx
+        self.vision = config.vision # whether to apply vision componnent (cross scan)
 
         if config.norm_first and layer_idx == 0:
             self.pre_norm = LayerNorm(hidden_size=config.hidden_size, bias=config.norm_bias, eps=config.norm_eps)
@@ -124,8 +131,22 @@ class RWKV6Block(nn.Module):
         output_attentions: Optional[bool] = False,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        # shape (hidden_states) = (batch_size, seq_len, hidden_size)
         residual = self.pre_norm(hidden_states) if hasattr(self, 'pre_norm') else hidden_states
-        hidden_states = self.attn_norm(residual)
+        if self.vision:
+            # apply cross scan to the sequence
+            B, L, D  = hidden_states.shape
+            # print(f"before: {hidden_states.shape}")
+            assert (math.sqrt(L) * math.sqrt(L) == L)   # make sure it's a square
+            hidden_states = einops.rearrange(hidden_states, "b (h w) d -> b d h w", h=int(math.sqrt(L)), w=int(math.sqrt(L))) # change the shape to align with CV tasks
+            # apply cross scan to the sequence
+            # hidden_states = CrossScan.apply(hidden_states)
+            hidden_states = cross_scan_fn(hidden_states)
+            hidden_states = einops.rearrange(hidden_states, "b c d l -> b (c l) d")
+            # print(f"middle: {hidden_states.shape}")
+
+        # hidden_states = self.attn_norm(residual)
+        hidden_states = self.attn_norm(hidden_states)
         hidden_states, attentions, past_key_values = self.attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -133,6 +154,18 @@ class RWKV6Block(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions
         )
+
+        if self.vision:
+            # print(f"after1: {hidden_states.shape}")
+            # apply cross merge to the sequence
+            hidden_states = einops.rearrange(hidden_states, "b (c l) d -> b c d l", l=L)
+            hidden_states = einops.rearrange(hidden_states, "b c d (h w) -> b c d h w", h=int(math.sqrt(L)), w=int(math.sqrt(L)))
+            # print(f"after2: {hidden_states.shape}")
+            # hidden_states = CrossMerge.apply(hidden_states)
+            hidden_states = cross_merge_fn(hidden_states)
+            # print(hidden_states.shape)
+            hidden_states = einops.rearrange(hidden_states, "b d l -> b l d")
+            
         hidden_states, residual = self.ffn_norm(hidden_states, residual, True)
         hidden_states, past_key_values = self.ffn(hidden_states, attention_mask, past_key_values)
         hidden_states = residual + hidden_states
@@ -201,12 +234,15 @@ class RWKV6Model(RWKV6PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
-        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        if not config.vision:
+            self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        else:
+            self.embeddings = VisionEmbeddings(config)
         self.layers = nn.ModuleList([RWKV6Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = LayerNorm(config.hidden_size, bias=config.norm_bias, eps=config.norm_eps)
 
         self.gradient_checkpointing = False
+        self.vision = config.vision # whether to apply vision componnent (cross scan)
 
         self.post_init()
 
@@ -225,7 +261,7 @@ class RWKV6Model(RWKV6PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         if output_attentions:
             warnings.warn("`RWKV6Model` does not `output_attentions` now, setting it to `False`.")
@@ -247,7 +283,7 @@ class RWKV6Model(RWKV6PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
-        hidden_states = inputs_embeds
+        hidden_states = inputs_embeds # shape (batch_size, seq_len, hidden_size)
 
         if use_cache:
             if past_key_values is None:
@@ -412,6 +448,151 @@ class RWKV6ForCausalLM(RWKV6PreTrainedModel):
         hidden_states = outputs[0]
         fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
         logits = None if fuse_linear_and_cross_entropy else self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            if self.config.fuse_cross_entropy:
+                if fuse_linear_and_cross_entropy:
+                    loss_fct = FusedLinearCrossEntropyLoss()
+                else:
+                    loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
+            else:
+                loss_fct = nn.CrossEntropyLoss()
+            # Enable model parallelism
+            labels = labels.to(hidden_states.device)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
+            if fuse_linear_and_cross_entropy:
+                loss = loss_fct(hidden_states.view(-1, self.config.hidden_size),
+                                labels.view(-1),
+                                self.lm_head.weight,
+                                self.lm_head.bias)
+            else:
+                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class RWKV6ForImageClassification(RWKV6PreTrainedModel):
+    """
+    RWKV6 for image classification.
+    """
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = RWKV6Model(config)
+
+        self.vm_head = nn.Sequential(OrderedDict(
+            # norm=nn.LayerNorm(d_model),  # B,L,D
+            permute=Permute("b (h w) d -> b d h w", h=int(config.image_size // config.patch_size)),
+            avgpool=nn.AdaptiveAvgPool2d(1),
+            flatten=nn.Flatten(1),
+            head=nn.Linear(config.hidden_size, config.class_size),
+        ))
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def set_input_embeddings(self, value):
+        self.model.embeddings = value
+
+    def get_output_embeddings(self):
+        return self.vm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.vm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    def generate(self, *args, **kwargs):
+        try:
+            return super().generate(*args, **kwargs)
+        except AttributeError as exception:
+            if 'past_key_values' in str(exception):
+                raise AttributeError(
+                    f"You tried to call `generate` with a decoding strategy that manipulates `past_key_values`, "
+                    f"which is not supported for {self.__class__.__name__}. "
+                    f"Try another generation strategy instead. "
+                    f"For the available generation strategies, check this doc: "
+                    f"https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
+                )
+            else:
+                raise exception
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor = None,
+        past_key_values: Optional[Cache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs
+    ):
+        # only last token for `inputs_ids` if the `past_key_values` is passed along.
+        if past_key_values is not None:
+            if not isinstance(past_key_values, Cache):
+                past_key_values = Cache.from_legacy_cache(past_key_values, input_ids.shape[1] - 1)
+            input_ids, attention_mask = input_ids[:, -1:], attention_mask[:, -1:]
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {'inputs_embeds': inputs_embeds}
+        else:
+            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+            # recompiles graphs as the stride of the inputs is a guard.
+            # Ref: https://github.com/huggingface/transformers/pull/29114
+            # TODO: use `next_tokens` directly instead.
+            model_inputs = {'input_ids': input_ids.contiguous()}
+
+        model_inputs.update({
+            'past_key_values': past_key_values,
+            'use_cache': kwargs.get('use_cache'),
+            'attention_mask': attention_mask,
+        })
+        return model_inputs
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+
+        hidden_states = outputs[0]
+        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
+        logits = None if fuse_linear_and_cross_entropy else self.vm_head(hidden_states)
 
         loss = None
         if labels is not None:

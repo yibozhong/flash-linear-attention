@@ -36,6 +36,12 @@ class RWKV6Config(PretrainedConfig):
         initializer_range: float = 0.02,
         fuse_norm: bool = True,
         fuse_cross_entropy: bool = True,
+        vision: bool = False,
+        class_size: int = 100,
+        image_size: int = 224,
+        patch_size: int = 16,
+        num_channels: int = 3,
+        hidden_dropout_prob: float = 0.1,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -58,6 +64,13 @@ class RWKV6Config(PretrainedConfig):
         self.initializer_range = initializer_range
         self.fuse_norm = fuse_norm
         self.fuse_cross_entropy = fuse_cross_entropy
+        # vision model settings
+        self.vision = vision # whether apply it as a vision model
+        self.class_size = class_size
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.hidden_dropout_prob = hidden_dropout_prob
 
         super().__init__(
             pad_token_id=pad_token_id,
