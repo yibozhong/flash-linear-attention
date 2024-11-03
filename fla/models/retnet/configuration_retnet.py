@@ -46,6 +46,7 @@ class RetNetConfig(PretrainedConfig):
         patch_size: int = 16,
         num_channels: int = 3,
         hidden_dropout_prob: float = 0.1,
+        video: bool = False,
         **kwargs
     ) -> RetNetConfig:
         self.vocab_size = vocab_size
@@ -77,6 +78,9 @@ class RetNetConfig(PretrainedConfig):
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.hidden_dropout_prob = hidden_dropout_prob
+        # video model settings
+        self.video = video # whether apply it as a video model
+        
 
         super().__init__(
             pad_token_id=pad_token_id,

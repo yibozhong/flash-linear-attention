@@ -13,7 +13,7 @@ from fla.models.linear_attn import (LinearAttentionConfig,
                                     LinearAttentionModel)
 from fla.models.mamba import MambaConfig, MambaForCausalLM, MambaModel
 from fla.models.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model, Mamba2ForImageClassification
-from fla.models.retnet import RetNetConfig, RetNetForCausalLM, RetNetModel, RetNetForImageClassification
+from fla.models.retnet import RetNetConfig, RetNetForCausalLM, RetNetModel, RetNetForImageClassification, RetNetForVideoClassification
 from fla.models.rwkv6 import RWKV6Config, RWKV6ForCausalLM, RWKV6Model, RWKV6ForImageClassification
 from fla.models.samba import SambaConfig, SambaForCausalLM, SambaModel
 from fla.models.transformer import (TransformerConfig, TransformerForCausalLM,

@@ -21,7 +21,7 @@ from fla.models.utils import Cache
 from fla.modules import (FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss,
                          RMSNorm, RMSNormLinear)
 from fla.modules.activations import swiglu_linear
-from fla.models.utils import Permute, VisionEmbeddings, PatchEmbeddings
+from fla.models.utils import Permute, VisionEmbeddings, PatchEmbeddings, Mean
 from typing import List, Optional, Tuple, Union, OrderedDict
 logger = logging.get_logger(__name__)
 
@@ -88,7 +88,8 @@ class DeltaNetBlock(nn.Module):
             qk_activation=config.qk_activation,
             norm_first=config.norm_first,
             norm_eps=config.norm_eps,
-            layer_idx=layer_idx
+            layer_idx=layer_idx,
+            chunk_size=16,
         )
         if not config.norm_first:
             self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
@@ -437,11 +438,15 @@ class DeltaNetForImageClassification(DeltaNetPreTrainedModel):
         super().__init__(config)
         self.model = DeltaNetModel(config)
         self.vocab_size = config.vocab_size
+        # self.vm_head = nn.Sequential(OrderedDict(
+        #     # norm=nn.LayerNorm(d_model),  # B,L,D
+        #     permute=Permute("b (h w) d -> b d h w", h=int(config.image_size // config.patch_size)),
+        #     avgpool=nn.AdaptiveAvgPool2d(1),
+        #     flatten=nn.Flatten(1),
+        #     head=nn.Linear(config.hidden_size, config.class_size),
+        # ))
         self.vm_head = nn.Sequential(OrderedDict(
-            # norm=nn.LayerNorm(d_model),  # B,L,D
-            permute=Permute("b (h w) d -> b d h w", h=int(config.image_size // config.patch_size)),
-            avgpool=nn.AdaptiveAvgPool2d(1),
-            flatten=nn.Flatten(1),
+            mean=Mean(),
             head=nn.Linear(config.hidden_size, config.class_size),
         ))
 

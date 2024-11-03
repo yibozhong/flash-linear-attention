@@ -211,7 +211,8 @@ class MultiScaleRetention(nn.Module):
         elif mode == 'fused_chunk':
             o, recurrent_state = fused_chunk_retention(q, k, v, initial_state=state, output_final_state=use_cache)
         elif mode == 'parallel':
-            o, recurrent_state = parallel_retention(q, k, v, initial_state=state, output_final_state=use_cache)
+            # o, recurrent_state = parallel_retention(q, k, v, initial_state=state, output_final_state=use_cache)
+            o = parallel_retention(q, k, v)
         elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_retention(q, k, v, initial_state=state, output_final_state=use_cache)
         else:
