@@ -7,7 +7,7 @@ from fla.models.retnet.modeling_retnet import RetNetForCausalLM, RetNetModel, Re
 
 AutoConfig.register(RetNetConfig.model_type, RetNetConfig)
 AutoModel.register(RetNetConfig, RetNetModel)
-AutoModelForCausalLM.register(RetNetConfig, RetNetForCausalLM, RetNetForImageClassification, RetNetForVideoClassification), 
+AutoModelForCausalLM.register(RetNetConfig, RetNetForCausalLM, RetNetForImageClassification)
 
 
 __all__ = ['RetNetConfig', 'RetNetForCausalLM', 'RetNetModel', 'RetNetForImageClassification', 'RetNetForVideoClassification']

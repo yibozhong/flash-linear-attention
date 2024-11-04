@@ -476,7 +476,7 @@ class RetNetForImageClassification(RetNetPreTrainedModel):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: torch.LongTensor = None,
+        pixel_values: torch.LongTensor = None,
         past_key_values: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -485,8 +485,8 @@ class RetNetForImageClassification(RetNetPreTrainedModel):
         # only last token for `inputs_ids` if the `past_key_values` is passed along.
         if past_key_values is not None:
             if not isinstance(past_key_values, Cache):
-                past_key_values = Cache.from_legacy_cache(past_key_values, input_ids.shape[1] - 1)
-            input_ids, attention_mask = input_ids[:, -1:], attention_mask[:, -1:]
+                past_key_values = Cache.from_legacy_cache(past_key_values, pixel_values.shape[1] - 1)
+            pixel_values, attention_mask = pixel_values[:, -1:], attention_mask[:, -1:]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
@@ -496,7 +496,7 @@ class RetNetForImageClassification(RetNetPreTrainedModel):
             # recompiles graphs as the stride of the inputs is a guard.
             # Ref: https://github.com/huggingface/transformers/pull/29114
             # TODO: use `next_tokens` directly instead.
-            model_inputs = {'input_ids': input_ids.contiguous()}
+            model_inputs = {'input_ids': pixel_values.contiguous()}
 
         model_inputs.update({
             'past_key_values': past_key_values,
@@ -660,7 +660,7 @@ class RetNetForVideoClassification(RetNetPreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        pixel_values: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -678,7 +678,7 @@ class RetNetForVideoClassification(RetNetPreTrainedModel):
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=pixel_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
