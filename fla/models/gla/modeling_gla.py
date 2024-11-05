@@ -23,7 +23,7 @@ from fla.modules import (FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss,
 from fla.modules.activations import swiglu_linear
 
 logger = logging.get_logger(__name__)
-from fla.models.utils import Permute, VisionEmbeddings, PatchEmbeddings
+from fla.models.utils import Permute, VisionEmbeddings, PatchEmbeddings, Mean
 from typing import List, Optional, Tuple, Union, OrderedDict
 
 class GLAMLP(nn.Module):
@@ -57,13 +57,45 @@ class GLAMLP(nn.Module):
         gate, y = y.chunk(2, -1)
         return swiglu_linear(gate, y, self.down_proj.weight, self.down_proj.bias)
 
+class GLAMLPVISION(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: Optional[int] = None,
+        hidden_act: str = 'swish',
+        dropout: float = 0.1
+    ) -> GLAMLP:
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        if intermediate_size is None:
+            intermediate_size = int(hidden_size * 4)
+        self.intermediate_size = intermediate_size
+
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[hidden_act]
+        self.dropout = nn.Dropout(dropout)
+        print("GLAMLPVISION")
+
+    def forward(self, x):
+        y = self.up_proj(x)
+        y = self.act_fn(y)
+        y = self.down_proj(y)
+        y = self.dropout(y)
+        return y
+
 
 class GLABlock(nn.Module):
     def __init__(self, config: GLAConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        self.vision = config.vision
+        if not self.vision:
+            self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        else:
+            self.attn_norm = nn.LayerNorm(normalized_shape=config.hidden_size, eps=config.norm_eps, bias=False)
         self.attn = GatedLinearAttention(
             mode=config.attn_mode,
             hidden_size=config.hidden_size,
@@ -80,15 +112,27 @@ class GLABlock(nn.Module):
             norm_eps=config.norm_eps,
             clamp_min=config.clamp_min,
             fuse_norm=config.fuse_norm,
-            layer_idx=layer_idx
+            layer_idx=layer_idx,
+            vision=config.vision
         )
-        self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
-        self.mlp = GLAMLP(
-            hidden_size=config.hidden_size,
-            hidden_ratio=config.hidden_ratio,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act
-        )
+        if not self.vision:
+            self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        else:
+            self.mlp_norm = nn.LayerNorm(normalized_shape=config.hidden_size, eps=config.norm_eps, bias=False)
+        if not self.vision:
+            self.mlp = GLAMLP(
+                hidden_size=config.hidden_size,
+                hidden_ratio=config.hidden_ratio,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act
+            )
+        else:
+            self.mlp = GLAMLPVISION(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                dropout=config.hidden_dropout_prob
+            )
 
     def forward(
         self,
@@ -108,7 +152,11 @@ class GLABlock(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions
         )
-        hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        # if not self.vision:
+        #     hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        # else:
+        hidden_states = self.mlp_norm(hidden_states + residual)
+        residual = hidden_states
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -171,7 +219,10 @@ class GLAModel(GLAPreTrainedModel):
         else:
             self.embeddings = VisionEmbeddings(config)
         self.layers = nn.ModuleList([GLABlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        if not config.vision:
+            self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        else:
+            self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps)
 
         self.gradient_checkpointing = False
 
@@ -412,20 +463,163 @@ class GLAForCausalLM(GLAPreTrainedModel):
             attentions=outputs.attentions,
         )
 
+
+
 class GLAForImageClassification(GLAPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
         self.model = GLAModel(config)
         self.vocab_size = config.vocab_size
+        # self.vm_head = nn.Sequential(OrderedDict(
+        #     # norm=nn.LayerNorm(d_model),  # B,L,D
+        #     permute=Permute("b (h w) d -> b d h w", h=int(config.image_size // config.patch_size)),
+        #     avgpool=nn.AdaptiveAvgPool2d(1),
+        #     flatten=nn.Flatten(1),
+        #     head=nn.Linear(config.hidden_size, config.class_size),
+        # ))
         self.vm_head = nn.Sequential(OrderedDict(
-            # norm=nn.LayerNorm(d_model),  # B,L,D
-            permute=Permute("b (h w) d -> b d h w", h=int(config.image_size // config.patch_size)),
-            avgpool=nn.AdaptiveAvgPool2d(1),
-            flatten=nn.Flatten(1),
+            mean=Mean(),
             head=nn.Linear(config.hidden_size, config.class_size),
         ))
 
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embeddings
+
+    def set_input_embeddings(self, value):
+        self.model.embeddings = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    def generate(self, *args, **kwargs):
+        try:
+            return super().generate(*args, **kwargs)
+        except AttributeError as exception:
+            if 'past_key_values' in str(exception):
+                raise AttributeError(
+                    f"You tried to call `generate` with a decoding strategy that manipulates `past_key_values`, "
+                    f"which is not supported for {self.__class__.__name__}. "
+                    f"Try another generation strategy instead. "
+                    f"For the available generation strategies, check this doc: "
+                    f"https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
+                )
+            else:
+                raise exception
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor = None,
+        past_key_values: Optional[Tuple[List[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs
+    ):
+        # only last token for `inputs_ids` if the `past_key_values` is passed along.
+        if past_key_values is not None:
+            if not isinstance(past_key_values, Cache):
+                past_key_values = Cache.from_legacy_cache(past_key_values, input_ids.shape[1] - 1)
+            input_ids, attention_mask = input_ids[:, -1:], attention_mask[:, -1:]
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {'inputs_embeds': inputs_embeds}
+        else:
+            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+            # recompiles graphs as the stride of the inputs is a guard.
+            # Ref: https://github.com/huggingface/transformers/pull/29114
+            # TODO: use `next_tokens` directly instead.
+            model_inputs = {'input_ids': input_ids.contiguous()}
+
+        model_inputs.update({
+            'past_key_values': past_key_values,
+            'use_cache': kwargs.get('use_cache'),
+            'attention_mask': attention_mask,
+        })
+        return model_inputs
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[List[torch.Tensor]]] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+
+        hidden_states = outputs[0]
+        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
+        logits = None if fuse_linear_and_cross_entropy else self.vm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            if self.config.fuse_cross_entropy:
+                if fuse_linear_and_cross_entropy:
+                    loss_fct = FusedLinearCrossEntropyLoss()
+                else:
+                    loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
+            else:
+                loss_fct = nn.CrossEntropyLoss()
+            # Enable model parallelism
+            labels = labels.to(hidden_states.device)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
+            if fuse_linear_and_cross_entropy:
+                loss = loss_fct(hidden_states.view(-1, self.config.hidden_size),
+                                labels.view(-1),
+                                self.lm_head.weight,
+                                self.lm_head.bias)
+            else:
+                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+class GLAForSemanticSegmentation(GLAPreTrainedModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = GLAModel(config)
         # Initialize weights and apply final processing
         self.post_init()
 

@@ -13,6 +13,7 @@ import collections
 import triton
 import triton.language as tl
 import numpy as np
+from transformers.file_utils import ModelOutput
 
 @triton.jit
 def triton_cross_scan_flex(
@@ -666,3 +667,4 @@ class Cache(transformers.cache_utils.Cache):
             for layer_idx in range(len(past_key_values)):
                 cache.update(past_key_values[layer_idx], layer_idx)
         return cache
+

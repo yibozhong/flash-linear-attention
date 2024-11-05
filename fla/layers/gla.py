@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
-from fla.modules.activations import ACT2FN
+# from fla.modules.activations import ACT2FN
+from transformers.activations import ACT2FN
 from fla.ops.gla import chunk_gla, fused_chunk_gla, fused_recurrent_gla
 
 if TYPE_CHECKING:
@@ -87,10 +88,12 @@ class GatedLinearAttention(nn.Module):
         clamp_min: Optional[float] = None,
         fuse_norm: bool = True,
         layer_idx: int = None,
+        vision: bool = False
     ) -> GatedLinearAttention:
         super().__init__()
 
         self.mode = mode
+        self.vision = vision
         self.hidden_size = hidden_size
         self.expand_k = expand_k
         self.expand_v = expand_v
@@ -139,7 +142,12 @@ class GatedLinearAttention(nn.Module):
             self.fuse_norm_and_gate = True
         else:
             self.fuse_norm_and_gate = False
-            self.g_norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine, eps=norm_eps)
+            if not self.vision:
+                self.g_norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine, eps=norm_eps)
+            else:
+                # use layer norm
+                print("using layer norm in GLA attnetion")
+                self.g_norm = nn.LayerNorm(elementwise_affine=elementwise_affine, normalized_shape=self.head_v_dim, eps=norm_eps)
             self.gate_fn = ACT2FN[gate_fn]
 
         self.gate_logit_normalizer = gate_logit_normalizer
