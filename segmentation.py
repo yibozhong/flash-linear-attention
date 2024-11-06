@@ -1,155 +1,141 @@
+from transformers import pipeline
+from PIL import Image
+import requests
 from datasets import load_dataset
 import json
 from pathlib import Path
 from huggingface_hub import hf_hub_download
+from datasets import Dataset, DatasetDict, Image
 from transformers import AutoImageProcessor
-from sam import SamModel, SamProcessor, SamConfig
-from torchvision import transforms
-import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import evaluate
-from torch.utils.data import Dataset
+from torchvision.transforms import ColorJitter
 import numpy as np
-from torch.optim import Adam
-import monai
-from PIL import Image
-# device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import torch
+from torch import nn
+from transformers import TrainingArguments, Trainer
+from segformer import SegformerForSemanticSegmentation
+import evaluate
+import time
 
-def get_bounding_box(ground_truth_map):
-  # get bounding box from mask
-  y_indices, x_indices = np.where(ground_truth_map > 0)
-  x_min, x_max = np.min(x_indices), np.max(x_indices)
-  y_min, y_max = np.min(y_indices), np.max(y_indices)
-  # add perturbation to bounding box coordinates
-  H, W = ground_truth_map.shape
-  x_min = max(0, x_min - np.random.randint(0, 20))
-  x_max = min(W, x_max + np.random.randint(0, 20))
-  y_min = max(0, y_min - np.random.randint(0, 20))
-  y_max = min(H, y_max + np.random.randint(0, 20))
-  bbox = [x_min, y_min, x_max, y_max]
-
-  return bbox
-
-class SAMDataset(Dataset):
-  def __init__(self, dataset, processor):
-    self.dataset = dataset
-    self.processor = processor
-
-  def __len__(self):
-    return len(self.dataset)
-
-  def __getitem__(self, idx):
-    item = self.dataset[idx]
-    image = item["image"]
-    ground_truth_mask = np.array(item["label"])
-    # print(f"gound mask shape :{ground_truth_mask.shape}")
-    # get bounding box prompt
-    prompt = get_bounding_box(ground_truth_mask)
-
-    # prepare image and prompt for the model
-    inputs = self.processor(image, input_boxes=[[prompt]], return_tensors="pt")
-
-    # remove batch dimension which the processor adds by default
-    inputs = {k:v.squeeze(0) for k,v in inputs.items()}
-
-    # add ground truth segmentation
-    inputs["ground_truth_mask"] = ground_truth_mask
-
-    return inputs
-  
-seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-
-def train_one_epoch(model, dataloader, optimizer, device, criterion):
-    model.train()
-    total_loss = 0.0
-    for batch in tqdm(dataloader):
-        outputs = model(pixel_values=batch["pixel_values"].to(device),
-                      input_boxes=batch["input_boxes"].to(device),
-                      multimask_output=False)
-
-        # compute loss
-        predicted_masks = outputs.pred_masks.squeeze(1)
-        ground_truth_masks = batch["ground_truth_mask"].float().to(device)
-        loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
-
-        # backward pass (compute gradients of parameters w.r.t. loss)
-        optimizer.zero_grad()
-        loss.backward()
-
-        # optimize
-        optimizer.step()
-        print(f"Loss: {loss.item()}")
-    return total_loss / len(dataloader)
-
-def evaluate_model(model, dataloader, device, metric):
-    model.eval()
-    metric = evaluate.load("mean_iou")
-    
+def compute_metrics(eval_pred):
     with torch.no_grad():
-        for batch in tqdm(dataloader):
-            outputs = model(pixel_values=batch["pixel_values"].to(device),
-                            input_boxes=batch["input_boxes"].to(device),
-                            multimask_output=False)
-            predicted_masks = outputs.pred_masks.squeeze()
-            ground_truth_masks = batch["ground_truth_mask"]
-            
-            # 将预测和真实掩码转换为 PIL 图像格式
-            # print(predicted_masks.shape)
-            # print(ground_truth_masks.shape)
-            predicted_masks_images = [Image.fromarray(mask.cpu().numpy(), mode='L') for mask in predicted_masks]
-            ground_truth_masks_images = [Image.fromarray(mask.cpu().numpy(), mode='L') for mask in ground_truth_masks]
-            
-            # 更新指标
-            metrics = metric.compute(predictions=predicted_masks_images, references=ground_truth_masks_images,
-                                     num_labels=2,
-                                     ignore_index=255)
-            print(metrics)
-    
-    return metrics
+        logits, labels = eval_pred
+        logits_tensor = torch.from_numpy(logits)
+        logits_tensor = nn.functional.interpolate(
+            logits_tensor,
+            size=labels.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).argmax(dim=1)
 
+        pred_labels = logits_tensor.detach().cpu().numpy()
+        metrics = metric.compute(
+            predictions=pred_labels,
+            references=labels,
+            num_labels=num_labels,
+            ignore_index=255,
+            reduce_labels=False,
+        )
+        for key, value in metrics.items():
+            if isinstance(value, np.ndarray):
+                metrics[key] = value.tolist()
+        return metrics
 
-
-# load dataset
-ds = load_dataset("nielsr/breast-cancer", split="train")
+# dataset
+ds = load_dataset("scene_parse_150", split="train", cache_dir="./data")
 ds = ds.train_test_split(test_size=0.2)
 train_ds = ds["train"]
 test_ds = ds["test"]
+# id and labels
+repo_id = "huggingface/label-files"
+filename = "ade20k-id2label.json"
+id2label = json.loads(Path(hf_hub_download(repo_id, filename, repo_type="dataset")).read_text())
+id2label = {int(k): v for k, v in id2label.items()}
+label2id = {v: k for k, v in id2label.items()}
+num_labels = len(id2label)
+# preprocess
+checkpoint = "nvidia/mit-b0"
+image_processor = AutoImageProcessor.from_pretrained(checkpoint, do_reduce_labels=True)
 
-# ground_truth_mask = np.array(train_ds[0]["label"])
+jitter = ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.1)
 
-# mask_image = Image.fromarray((ground_truth_mask), mode='L')
+def train_transforms(example_batch):
+    images = [x for x in example_batch["image"]]
+    labels = [x for x in example_batch["annotation"]]
+    inputs = image_processor(images, labels)
+    return inputs
 
-# mask_image.save("ground_truth_mask.png")
 
-# define the models
-model_name = "facebook/sam-vit-base"
-config = SamConfig.from_pretrained(model_name)
-model = SamModel(config).to(device)
-model.requires_grad_(True)
-model.train()
-# change hidden size
+def val_transforms(example_batch):
+    images = [x for x in example_batch["image"]]
+    labels = [x for x in example_batch["annotation"]]
+    inputs = image_processor(images, labels)
+    return inputs
 
-processor = SamProcessor.from_pretrained(model_name)
+train_ds.set_transform(train_transforms)
+test_ds.set_transform(val_transforms)
 
-train_ds = SAMDataset(train_ds, processor)
-test_ds = SAMDataset(test_ds, processor)
+
+print(train_ds[0]['pixel_values'].shape)
+print(train_ds[0]['labels'].shape)
+print(test_ds[0]['pixel_values'].shape)
+print(test_ds[0]['labels'].shape)
 
 metric = evaluate.load("mean_iou")
 
-# train the model
-train_dataloader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=4)
-test_dataloader = DataLoader(test_ds, batch_size=4, shuffle=False, num_workers=4)
+# model
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-criterion = torch.nn.CrossEntropyLoss()
+model = SegformerForSemanticSegmentation.from_pretrained(checkpoint, id2label=id2label, label2id=label2id)
 
-test_iou = evaluate_model(model, test_dataloader, device, metric)
 
-num_epochs = 0
-for epoch in range(num_epochs):
-    train_loss = train_one_epoch(model, train_dataloader, optimizer, device, criterion)
-    print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
-    test_iou = evaluate_model(model, test_dataloader, device, metric)
-    print(type(test_iou))
+# check trainbale parameters
+
+param_count = 0
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        param_count += param.numel()
+
+print(f"total parameters : {param_count}")
+
+print(train_ds[0]['pixel_values'].shape)
+
+
+training_args = TrainingArguments(
+    output_dir="segformer-b0-scene-parse-150",
+    learning_rate=1e-4,
+    num_train_epochs=5,
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=32,
+    save_total_limit=1,
+    eval_strategy="steps",
+    save_strategy="steps",
+    save_steps=20,
+    eval_steps=1,
+    logging_steps=50,
+    eval_accumulation_steps=5,
+    remove_unused_columns=False,
+    push_to_hub=False,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=test_ds,
+    compute_metrics=compute_metrics,
+)
+
+time1 = time.time()
+
+trainer.train()
+
+time2 = time.time()
+
+print(f"training time : {(time2 - time1) / 60}")
+
+eval_results = trainer.evaluate()
+
+# 打印评估结果
+print("Evaluation results:", eval_results)
+# write the results to a file
+with open("eval_results.txt", "w") as f:
+    f.write(json.dumps(eval_results))
