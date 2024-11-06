@@ -9,30 +9,77 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import evaluate
+from torch.utils.data import Dataset
 import numpy as np
-# load dataset
-ds = load_dataset("scene_parse_150", split="train[:50]", cache_dir="./data/")
-ds = ds.train_test_split(test_size=0.2)
-train_ds = ds["train"]
-test_ds = ds["test"]
-
+from torch.optim import Adam
+import monai
 # device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def get_bounding_box(ground_truth_map):
+  # get bounding box from mask
+  y_indices, x_indices = np.where(ground_truth_map > 0)
+  x_min, x_max = np.min(x_indices), np.max(x_indices)
+  y_min, y_max = np.min(y_indices), np.max(y_indices)
+  # add perturbation to bounding box coordinates
+  H, W = ground_truth_map.shape
+  x_min = max(0, x_min - np.random.randint(0, 20))
+  x_max = min(W, x_max + np.random.randint(0, 20))
+  y_min = max(0, y_min - np.random.randint(0, 20))
+  y_max = min(H, y_max + np.random.randint(0, 20))
+  bbox = [x_min, y_min, x_max, y_max]
+
+  return bbox
+
+class SAMDataset(Dataset):
+  def __init__(self, dataset, processor):
+    self.dataset = dataset
+    self.processor = processor
+
+  def __len__(self):
+    return len(self.dataset)
+
+  def __getitem__(self, idx):
+    item = self.dataset[idx]
+    image = item["image"]
+    ground_truth_mask = np.array(item["label"])
+
+    # get bounding box prompt
+    prompt = get_bounding_box(ground_truth_mask)
+
+    # prepare image and prompt for the model
+    inputs = self.processor(image, input_boxes=[[prompt]], return_tensors="pt")
+
+    # remove batch dimension which the processor adds by default
+    inputs = {k:v.squeeze(0) for k,v in inputs.items()}
+
+    # add ground truth segmentation
+    inputs["ground_truth_mask"] = ground_truth_mask
+
+    return inputs
+  
+seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
 def train_one_epoch(model, dataloader, optimizer, device, criterion):
     model.train()
     total_loss = 0.0
     for batch in tqdm(dataloader):
-        images = batch['pixel_values'].to(device)
-        labels = batch['label'].to(device).long()
+        outputs = model(pixel_values=batch["pixel_values"].to(device),
+                      input_boxes=batch["input_boxes"].to(device),
+                      multimask_output=False)
 
+        # compute loss
+        predicted_masks = outputs.pred_masks.squeeze(1)
+        ground_truth_masks = batch["ground_truth_mask"].float().to(device)
+        loss = seg_loss(predicted_masks, ground_truth_masks.unsqueeze(1))
+
+        # backward pass (compute gradients of parameters w.r.t. loss)
         optimizer.zero_grad()
-        masks_pred = model(images).pred_masks
-        loss = criterion(masks_pred, labels)
         loss.backward()
+
+        # optimize
         optimizer.step()
-        print('Epoch: {}, Loss: {}'.format(epoch, loss.item()))
-        total_loss += loss.item()
+        print(f"Loss: {loss.item()}")
     return total_loss / len(dataloader)
 
 def evaluate_model(model, dataloader, device, metric):
@@ -56,16 +103,12 @@ def evaluate_model(model, dataloader, device, metric):
     return mean_iou
 
 
-def collate_fn(batch):
-    pass
+# load dataset
+ds = load_dataset("nielsr/breast-cancer", split="train")
+ds = ds.train_test_split(test_size=0.2)
+train_ds = ds["train"]
+test_ds = ds["test"]
 
-# define label mapping
-repo_id = "huggingface/label-files"
-filename = "ade20k-id2label.json"
-id2label = json.loads(Path(hf_hub_download(repo_id, filename, repo_type="dataset")).read_text())
-id2label = {int(k): v for k, v in id2label.items()}
-label2id = {v: k for k, v in id2label.items()}
-num_labels = len(id2label)
 
 # define the models
 model_name = "facebook/sam-vit-base"
@@ -77,20 +120,8 @@ model.train()
 
 processor = SamProcessor.from_pretrained(model_name)
 
-def transforms(example_batch):
-    images = example_batch["image"]
-    labels = example_batch["annotation"]
-    inputs = processor(images, return_tensors="pt", )
-    labels = processor(images, return_tensors="pt", )
-    a = inputs["pixel_values"]
-    b = labels['pixel_values']
-    # resize b using torchvision
-    # print(type(a), type(b))
-    return {"pixel_values": a, "label": b}
-
-
-train_ds.set_transform(transforms,)
-test_ds.set_transform(transforms,)
+train_ds = SAMDataset(train_ds, processor)
+test_ds = SAMDataset(test_ds, processor)
 
 metric = evaluate.load("mean_iou")
 
