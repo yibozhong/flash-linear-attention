@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 import numpy as np
 from torch.optim import Adam
 import monai
+from PIL import Image
 # device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -43,7 +44,7 @@ class SAMDataset(Dataset):
     item = self.dataset[idx]
     image = item["image"]
     ground_truth_mask = np.array(item["label"])
-
+    # print(f"gound mask shape :{ground_truth_mask.shape}")
     # get bounding box prompt
     prompt = get_bounding_box(ground_truth_mask)
 
@@ -84,23 +85,30 @@ def train_one_epoch(model, dataloader, optimizer, device, criterion):
 
 def evaluate_model(model, dataloader, device, metric):
     model.eval()
-    total_iou = 0.0
-    total_samples = 0
+    metric = evaluate.load("mean_iou")
+    
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            images = batch['pixel_values'].to(device)
-            labels = batch['label'].to(device)
+        for batch in tqdm(dataloader):
+            outputs = model(pixel_values=batch["pixel_values"].to(device),
+                            input_boxes=batch["input_boxes"].to(device),
+                            multimask_output=False)
+            predicted_masks = outputs.pred_masks.squeeze()
+            ground_truth_masks = batch["ground_truth_mask"]
+            
+            # 将预测和真实掩码转换为 PIL 图像格式
+            # print(predicted_masks.shape)
+            # print(ground_truth_masks.shape)
+            predicted_masks_images = [Image.fromarray(mask.cpu().numpy(), mode='L') for mask in predicted_masks]
+            ground_truth_masks_images = [Image.fromarray(mask.cpu().numpy(), mode='L') for mask in ground_truth_masks]
+            
+            # 更新指标
+            metrics = metric.compute(predictions=predicted_masks_images, references=ground_truth_masks_images,
+                                     num_labels=2,
+                                     ignore_index=255)
+            print(metrics)
+    
+    return metrics
 
-            inputs = processor(images=images, return_tensors="pt").to(device)
-            outputs = model(**inputs)
-            masks = outputs.logits
-
-            # 计算IoU
-            iou = metric.compute(predictions=masks.argmax(dim=1).cpu().numpy(), references=labels.cpu().numpy())
-            total_iou += iou['mean_iou']
-            total_samples += 1
-    mean_iou = total_iou / total_samples
-    return mean_iou
 
 
 # load dataset
@@ -109,6 +117,11 @@ ds = ds.train_test_split(test_size=0.2)
 train_ds = ds["train"]
 test_ds = ds["test"]
 
+# ground_truth_mask = np.array(train_ds[0]["label"])
+
+# mask_image = Image.fromarray((ground_truth_mask), mode='L')
+
+# mask_image.save("ground_truth_mask.png")
 
 # define the models
 model_name = "facebook/sam-vit-base"
@@ -132,10 +145,11 @@ test_dataloader = DataLoader(test_ds, batch_size=4, shuffle=False, num_workers=4
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 criterion = torch.nn.CrossEntropyLoss()
 
-num_epochs = 10
+test_iou = evaluate_model(model, test_dataloader, device, metric)
+
+num_epochs = 0
 for epoch in range(num_epochs):
     train_loss = train_one_epoch(model, train_dataloader, optimizer, device, criterion)
     print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
     test_iou = evaluate_model(model, test_dataloader, device, metric)
-    print(f"Epoch {epoch + 1}, Test IoU: {test_iou:.4f}")
-
+    print(type(test_iou))
