@@ -5,39 +5,51 @@ from datasets import load_dataset
 import json
 from pathlib import Path
 from huggingface_hub import hf_hub_download
-from datasets import Dataset, DatasetDict, Image
-from transformers import AutoImageProcessor
+from datasets import Dataset, DatasetDict
+from PIL import Image
 from torchvision.transforms import ColorJitter
 import numpy as np
 import torch
 from torch import nn
 from transformers import TrainingArguments, Trainer
 from segformer import SegformerForSemanticSegmentation
+from transformers import AutoImageProcessor
 import evaluate
 import time
+import json
+from huggingface_hub import hf_hub_url
+from huggingface_hub import hf_hub_download
 
 def compute_metrics(eval_pred):
     with torch.no_grad():
         logits, labels = eval_pred
         logits_tensor = torch.from_numpy(logits)
+        # scale the logits to the size of the label
         logits_tensor = nn.functional.interpolate(
             logits_tensor,
             size=labels.shape[-2:],
-            mode="bilinear",
+            mode="bilinear",    
             align_corners=False,
         ).argmax(dim=1)
 
         pred_labels = logits_tensor.detach().cpu().numpy()
-        metrics = metric.compute(
+        # currently using _compute instead of compute
+        # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
+        metrics = metric._compute(
             predictions=pred_labels,
             references=labels,
-            num_labels=num_labels,
-            ignore_index=255,
-            reduce_labels=False,
+            num_labels=len(id2label),
+            ignore_index=0,
+            reduce_labels=image_processor.do_reduce_labels,
         )
-        for key, value in metrics.items():
-            if isinstance(value, np.ndarray):
-                metrics[key] = value.tolist()
+
+        # add per category metrics as individual key-value pairs
+        per_category_accuracy = metrics.pop("per_category_accuracy").tolist()
+        per_category_iou = metrics.pop("per_category_iou").tolist()
+
+        metrics.update({f"accuracy_{id2label[i]}": v for i, v in enumerate(per_category_accuracy)})
+        metrics.update({f"iou_{id2label[i]}": v for i, v in enumerate(per_category_iou)})
+
         return metrics
 
 # dataset
@@ -58,15 +70,24 @@ image_processor = AutoImageProcessor.from_pretrained(checkpoint, do_reduce_label
 
 jitter = ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.1)
 
+def handle_grayscale_image(image):
+    np_image = np.array(image)
+    if np_image.ndim == 2:
+        tiled_image = np.tile(np.expand_dims(np_image, -1), 3)
+        return Image.fromarray(tiled_image)
+    else:
+        return Image.fromarray(np_image)
+
+
 def train_transforms(example_batch):
-    images = [x for x in example_batch["image"]]
+    images = [jitter(handle_grayscale_image(x)) for x in example_batch["image"]]
     labels = [x for x in example_batch["annotation"]]
     inputs = image_processor(images, labels)
     return inputs
 
 
 def val_transforms(example_batch):
-    images = [x for x in example_batch["image"]]
+    images = [handle_grayscale_image(x) for x in example_batch["image"]]
     labels = [x for x in example_batch["annotation"]]
     inputs = image_processor(images, labels)
     return inputs
@@ -84,7 +105,7 @@ metric = evaluate.load("mean_iou")
 
 # model
 
-model = SegformerForSemanticSegmentation.from_pretrained(checkpoint, id2label=id2label, label2id=label2id)
+model = SegformerForSemanticSegmentation.from_pretrained(checkpoint, id2label=id2label, label2id=label2id, ignore_mismatched_sizes=True)
 
 
 # check trainbale parameters
@@ -102,16 +123,16 @@ print(train_ds[0]['pixel_values'].shape)
 training_args = TrainingArguments(
     output_dir="segformer-b0-scene-parse-150",
     learning_rate=1e-4,
-    num_train_epochs=5,
+    num_train_epochs=1,
     per_device_train_batch_size=32,
-    per_device_eval_batch_size=32,
+    per_device_eval_batch_size=4,
     save_total_limit=1,
     eval_strategy="steps",
     save_strategy="steps",
     save_steps=20,
-    eval_steps=1,
+    eval_steps=20,
     logging_steps=50,
-    eval_accumulation_steps=5,
+    label_names=["labels"],
     remove_unused_columns=False,
     push_to_hub=False,
 )
