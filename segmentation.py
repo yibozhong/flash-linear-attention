@@ -19,44 +19,173 @@ import time
 import json
 from huggingface_hub import hf_hub_url
 from huggingface_hub import hf_hub_download
+from tqdm import tqdm
+
+
+class SegTrainer(Trainer):
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        eval_dataloader = self.eval_dataset
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        num_examples = len(eval_dataloader)
+        total_loss = 0.0
+        # Initialize metrics
+        total_metrics = None
+        num_batches = 0
+        
+        for inputs in tqdm(eval_dataloader):
+            # Forward pass
+            with torch.no_grad():
+                losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only=False, ignore_keys=ignore_keys)
+                # Scale the logits to the size of the label
+                logits = nn.functional.interpolate(
+                    logits,
+                    size=labels.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).argmax(dim=1)
+                
+                # Convert to numpy
+                pred_labels = logits.detach().cpu().numpy()
+                labels = labels.detach().cpu().numpy()
+                
+                # Compute metrics for the batch
+                batch_metrics = metric._compute(
+                    predictions=pred_labels,
+                    references=labels,
+                    num_labels=len(id2label),
+                    ignore_index=0,
+                    reduce_labels=image_processor.do_reduce_labels,
+                )
+                
+                # Delete intermediate variables
+                # del logits
+                # del labels
+                # del pred_labels
+                
+                # Accumulate metrics
+                if total_metrics is None:
+                    total_metrics = batch_metrics
+                else:
+                    for key in total_metrics:
+                        total_metrics[key] += batch_metrics[key]
+                 
+                total_loss += losses.sum().item()    
+                # Manually empty the cache
+                torch.cuda.empty_cache()
+                num_batches += 1
+        
+        # Average the metrics
+        total_metrics[key] /= num_batches
+        total_loss /= num_batches
+        # Remove unwanted metrics
+        total_metrics.pop("per_category_accuracy", None)
+        total_metrics.pop("per_category_iou", None)
+        # add new key loss to metric
+        print(f"\ntotal eval average loss: {total_loss}")
+        # log
+        self.log(total_metrics)
+        
+        return total_metrics
+
+# def compute_metrics(eval_pred):
+#     with torch.no_grad():
+#         logits, labels = eval_pred
+#         logits_tensor = torch.from_numpy(logits)
+#         # scale the logits to the size of the label
+#         print(logits_tensor.shape, labels.shape)
+#         logits_tensor = nn.functional.interpolate(
+#             logits_tensor,
+#             size=labels.shape[-2:],
+#             mode="bilinear",    
+#             align_corners=False,
+#         ).argmax(dim=1)
+
+#         pred_labels = logits_tensor.detach().cpu().numpy()
+#         # currently using _compute instead of compute
+#         # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
+#         metrics = metric._compute(
+#             predictions=pred_labels,
+#             references=labels,
+#             num_labels=len(id2label),
+#             ignore_index=0,
+#             reduce_labels=image_processor.do_reduce_labels,
+#         )
+
+#         # delete these two fields
+#         metrics.pop("per_category_accuracy")
+#         metrics.pop("per_category_iou")
+
+#         # metrics.update({f"accuracy_{id2label[i]}": v for i, v in enumerate(per_category_accuracy)})
+#         # metrics.update({f"iou_{id2label[i]}": v for i, v in enumerate(per_category_iou)})
+
+#         return metrics
 
 def compute_metrics(eval_pred):
-    with torch.no_grad():
-        logits, labels = eval_pred
-        logits_tensor = torch.from_numpy(logits)
-        # scale the logits to the size of the label
-        logits_tensor = nn.functional.interpolate(
-            logits_tensor,
-            size=labels.shape[-2:],
-            mode="bilinear",    
+    logits, labels = eval_pred.predictions, eval_pred.label_ids
+    batch_size = 32
+    # Convert logits to tensor
+    logits_tensor = torch.from_numpy(logits)
+    
+    # Initialize metrics
+    total_metrics = None
+    
+    # Process in batches
+    for i in range(0, logits_tensor.shape[0], batch_size):
+        batch_logits = logits_tensor[i:i + batch_size]
+        batch_labels = labels[i:i + batch_size]
+        print(batch_logits.shape, batch_labels.shape)
+        # Scale the logits to the size of the label
+        batch_logits = nn.functional.interpolate(
+            batch_logits,
+            size=batch_labels.shape[-2:],
+            mode="bilinear",
             align_corners=False,
         ).argmax(dim=1)
-
-        pred_labels = logits_tensor.detach().cpu().numpy()
-        # currently using _compute instead of compute
-        # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
-        metrics = metric._compute(
-            predictions=pred_labels,
-            references=labels,
+        
+        # Convert to numpy
+        batch_pred_labels = batch_logits.detach().cpu().numpy()
+        
+        # Compute metrics for the batch
+        batch_metrics = metric._compute(
+            predictions=batch_pred_labels,
+            references=batch_labels,
             num_labels=len(id2label),
             ignore_index=0,
             reduce_labels=image_processor.do_reduce_labels,
         )
+        
+        del batch_logits
+        del batch_labels
+        del batch_pred_labels
 
-        # add per category metrics as individual key-value pairs
-        per_category_accuracy = metrics.pop("per_category_accuracy").tolist()
-        per_category_iou = metrics.pop("per_category_iou").tolist()
-
-        metrics.update({f"accuracy_{id2label[i]}": v for i, v in enumerate(per_category_accuracy)})
-        metrics.update({f"iou_{id2label[i]}": v for i, v in enumerate(per_category_iou)})
-
-        return metrics
+        # Accumulate metrics
+        if total_metrics is None:
+            total_metrics = batch_metrics
+        else:
+            for key in total_metrics:
+                total_metrics[key] += batch_metrics[key]
+        
+        torch.cuda.empty_cache()
+    
+    # Average the metrics
+    for key in total_metrics:
+        total_metrics[key] /= (logits_tensor.shape[0] / batch_size)
+    
+    # Remove unwanted metrics
+    total_metrics.pop("per_category_accuracy", None)
+    total_metrics.pop("per_category_iou", None)
+    
+    return total_metrics
 
 # dataset
 ds = load_dataset("scene_parse_150", split="train", cache_dir="./data")
 ds = ds.train_test_split(test_size=0.2)
 train_ds = ds["train"]
 test_ds = ds["test"]
+# train_ds = load_dataset("scene_parse_150", split="train", cache_dir="./data")
+# test_ds = load_dataset("scene_parse_150", split="test", cache_dir="./data")
+print(len(train_ds), len(test_ds))
+
 # id and labels
 repo_id = "huggingface/label-files"
 filename = "ade20k-id2label.json"
@@ -95,12 +224,6 @@ def val_transforms(example_batch):
 train_ds.set_transform(train_transforms)
 test_ds.set_transform(val_transforms)
 
-
-print(train_ds[0]['pixel_values'].shape)
-print(train_ds[0]['labels'].shape)
-print(test_ds[0]['pixel_values'].shape)
-print(test_ds[0]['labels'].shape)
-
 metric = evaluate.load("mean_iou")
 
 # model
@@ -123,9 +246,9 @@ print(train_ds[0]['pixel_values'].shape)
 training_args = TrainingArguments(
     output_dir="segformer-b0-scene-parse-150",
     learning_rate=1e-4,
-    num_train_epochs=1,
+    num_train_epochs=30,
     per_device_train_batch_size=32,
-    per_device_eval_batch_size=4,
+    per_device_eval_batch_size=32,
     save_total_limit=1,
     eval_strategy="steps",
     save_strategy="steps",
@@ -137,7 +260,7 @@ training_args = TrainingArguments(
     push_to_hub=False,
 )
 
-trainer = Trainer(
+trainer = SegTrainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
