@@ -160,6 +160,8 @@ class MultiScaleRetention(nn.Module):
         output_attentions: Optional[bool] = False,
         **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+        # print(f"attention_mask: {attention_mask}")
+        # print(f"past_key_values: {past_key_values}")
         # launching the triton kernel for just one token will actually be slower
         mode = 'fused_recurrent' if hidden_states.shape[1] == 1 else self.mode
 
