@@ -21,7 +21,6 @@ from huggingface_hub import hf_hub_url
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 from fla.models import GLAConfig
-
 # fix seed to 42
 torch.manual_seed(42)
 
@@ -60,10 +59,6 @@ class SegTrainer(Trainer):
                     reduce_labels=image_processor.do_reduce_labels,
                 )
                 
-                # Delete intermediate variables
-                # del logits
-                # del labels
-                # del pred_labels
                 
                 # Accumulate metrics
                 if total_metrics is None:
@@ -73,13 +68,13 @@ class SegTrainer(Trainer):
                         total_metrics[key] += batch_metrics[key]
                  
                 total_loss += losses.sum().item()    
-                # Manually empty the cache
+                # Manually empty the cache except for the last batch
                 torch.cuda.empty_cache()
                 num_batches += 1
         
         # Average the metrics
-        # for key in total_metrics:
-        #     total_metrics[key] /= num_batches
+        for key in total_metrics:
+            total_metrics[key] /= num_batches
         total_loss /= num_batches
         # Remove unwanted metrics
         total_metrics.pop("per_category_accuracy", None)
@@ -88,25 +83,30 @@ class SegTrainer(Trainer):
         # print(f"\ntotal eval average loss: {total_loss}")
         total_metrics["eval_loss"] = total_loss
         # create a field named eval_loss in the metrics
-
         # log
         self.log(total_metrics)
         
         return total_metrics
+
+def get_memory_usage(tensor):
+    # 获取张量的字节数
+    memory_usage = tensor.element_size() * tensor.nelement()
+    # 转换为 MB
+    memory_usage_mb = memory_usage / (1024 * 1024)
+    return memory_usage_mb
 
 def compute_metrics(eval_pred):
     with torch.no_grad():
         logits, labels = eval_pred
         logits_tensor = torch.from_numpy(logits)
         # scale the logits to the size of the label
-        print(logits_tensor.shape, labels.shape)
+        # print(f"tensor size is : {logits_tensor.shape}, memory usage is: {get_memory_usage(logits_tensor)}")
         logits_tensor = nn.functional.interpolate(
             logits_tensor,
             size=labels.shape[-2:],
             mode="bilinear",    
             align_corners=False,
         ).argmax(dim=1)
-
         pred_labels = logits_tensor.detach().cpu().numpy()
         # currently using _compute instead of compute
         # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
@@ -121,9 +121,6 @@ def compute_metrics(eval_pred):
         # delete these two fields
         metrics.pop("per_category_accuracy")
         metrics.pop("per_category_iou")
-
-        # metrics.update({f"accuracy_{id2label[i]}": v for i, v in enumerate(per_category_accuracy)})
-        # metrics.update({f"iou_{id2label[i]}": v for i, v in enumerate(per_category_iou)})
 
         return metrics
 
@@ -185,12 +182,12 @@ def compute_metrics(eval_pred):
 #     return total_metrics
 
 # dataset
-ds = load_dataset("scene_parse_150", split="train[:5000]", cache_dir="./data")
-ds = ds.train_test_split(test_size=0.1)
-train_ds = ds["train"]
-test_ds = ds["test"]
-# train_ds = load_dataset("scene_parse_150", split="train", cache_dir="./data")
-# # test_ds = load_dataset("scene_parse_150", split="validation", cache_dir="./data")
+# ds = load_dataset("scene_parse_150", split="train[:5000]", cache_dir="./data")
+# ds = ds.train_test_split(test_size=0.1)
+# train_ds = ds["train"]
+# test_ds = ds["test"]
+train_ds = load_dataset("scene_parse_150", split="train", cache_dir="./data")
+test_ds = load_dataset("scene_parse_150", split="validation", cache_dir="./data")
 # print(len(train_ds), len(test_ds))
 
 # id and labels
@@ -201,7 +198,7 @@ id2label = {int(k): v for k, v in id2label.items()}
 label2id = {v: k for k, v in id2label.items()}
 num_labels = len(id2label)
 # preprocess
-checkpoint = "nvidia/mit-b1"
+checkpoint = "nvidia/mit-b3"
 image_processor = AutoImageProcessor.from_pretrained(checkpoint, do_reduce_labels=True)
 
 jitter = ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.1)
@@ -237,20 +234,20 @@ config = SegformerConfig.from_pretrained(checkpoint)
 # model
 # print(config.num_labels)
 
-# config_gla = GLAConfig(vision=True, attn_mode='fused_chunk', num_heads=2)
-# # combine the two config
-# config_dict = config_gla.to_dict()
-# config_dict.update(config.to_dict())
-# merged_config = SegformerConfig.from_dict(config_dict)
-# merged_config.id2label = id2label
-# merged_config.label2id = label2id
-# merged_config.ignore_mismatched_sizes = True
-# # print(merged_config.semantic_loss_ignore_index)
-# print(merged_config.num_labels)
-# # model = SegformerForSemanticSegmentation(merged_config)
-# model = SegGLAForSemanticSegmentation(merged_config)
+config_gla = GLAConfig(vision=True, attn_mode='fused_chunk', num_heads=2)
+# combine the two config
+config_dict = config_gla.to_dict()
+config_dict.update(config.to_dict())
+merged_config = SegformerConfig.from_dict(config_dict)
+merged_config.id2label = id2label
+merged_config.label2id = label2id
+merged_config.ignore_mismatched_sizes = True
+# print(merged_config.semantic_loss_ignore_index)
+print(merged_config.num_labels)
 # model = SegformerForSemanticSegmentation(merged_config)
-model = SegformerForSemanticSegmentation.from_pretrained(checkpoint, id2label=id2label, label2id=label2id, ignore_mismatched_sizes=True)
+# model = SegGLAForSemanticSegmentation(merged_config)
+model = SegformerForSemanticSegmentation(merged_config)
+# model = SegformerForSemanticSegmentation.from_pretrained(checkpoint, id2label=id2label, label2id=label2id, ignore_mismatched_sizes=True)
 
 # print(model.config.num_labels)
 # # difference between config and model
@@ -275,12 +272,12 @@ print(f"total parameters : {param_count}")
 
 
 training_args = TrainingArguments(
-    output_dir="segformer-b0-scene-parse-150",
+    output_dir="segformer-b3",
     learning_rate=1e-3,
-    num_train_epochs=3,
+    num_train_epochs=5, # or 100
     per_device_train_batch_size=32,
     per_device_eval_batch_size=32,
-    save_total_limit=1,
+    save_total_limit=3,
     eval_strategy="steps",
     save_strategy="steps",
     save_steps=1000,
@@ -290,7 +287,8 @@ training_args = TrainingArguments(
     remove_unused_columns=False,
     push_to_hub=False,
     load_best_model_at_end=True,
-    # dataloader_num_workers=4,
+    dataloader_num_workers=8,
+    # lr_scheduler_type='constant',
 )
 
 trainer = Trainer(
@@ -298,7 +296,6 @@ trainer = Trainer(
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=test_ds,
-    compute_metrics=compute_metrics,
 )
 
 time1 = time.time()
@@ -314,5 +311,5 @@ eval_results = trainer.evaluate()
 # 打印评估结果
 print("Evaluation results:", eval_results)
 # write the results to a file
-with open("eval_results.txt", "w") as f:
+with open("eval_b3_full.txt", "w") as f:
     f.write(json.dumps(eval_results))
