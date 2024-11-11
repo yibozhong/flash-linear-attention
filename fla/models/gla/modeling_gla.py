@@ -14,6 +14,7 @@ from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+from einops import rearrange
 
 from fla.layers.gla import GatedLinearAttention
 from fla.models.gla.configuration_gla import GLAConfig
@@ -208,16 +209,51 @@ class GLAPreTrainedModel(PreTrainedModel):
                         p /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
 
 
+
+class ConvNet(nn.Module):
+    # a simple convlolution layer
+    def __init__(self, initial_chanel=3, depth=2, initial_conv_kernel_size=7, image_size=14):
+        super().__init__()
+        assert depth <= (initial_conv_kernel_size - 1) // 2
+        self.convgroups = nn.ModuleList()
+        self.image_size = image_size
+        input_channel = initial_chanel
+        for i in range(depth):
+            self.convgroups.append(nn.Sequential(
+                nn.Conv2d(input_channel, input_channel * 4, kernel_size=(initial_conv_kernel_size - 2 * i), stride=2), # make the H and W smaller
+                nn.ReLU(),
+            ))
+            input_channel = input_channel * 4
+        self.final_proj = nn.Linear(input_channel, 768)
+
+    def forward(self, x):
+        for conv in self.convgroups:
+            x = conv(x)
+        # interpolate back to the original image size
+        x = torch.nn.functional.interpolate(x, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+        x = rearrange(x, 'b c h w -> b (h w) c')
+        x = self.final_proj(x)
+        # print(f"final shape: {x.shape}")
+        return x
+
 class GLAModel(GLAPreTrainedModel):
 
     def __init__(self, config: GLAConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        if self.config.conv:
+            self.convnet = ConvNet(depth=2)
+            self.pos_embed = nn.Parameter(torch.randn(1, config.image_size * config.image_size, config.hidden_size))
+        else:
+            self.convnet = nn.Identity()
         if not config.vision:
             self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         else:
-            self.embeddings = VisionEmbeddings(config)
+            if not config.conv:
+                self.embeddings = VisionEmbeddings(config)
+            else:
+                self.embeddings = nn.Identity()
         self.layers = nn.ModuleList([GLABlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         if not config.vision:
             self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
@@ -264,7 +300,12 @@ class GLAModel(GLAPreTrainedModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.embeddings(input_ids)
+            input_ids = self.convnet(input_ids)
+            if not self.config.conv:
+                inputs_embeds = self.embeddings(input_ids)
+            else:
+                inputs_embeds = input_ids + self.pos_embed
+
         hidden_states = inputs_embeds
 
         if use_cache:

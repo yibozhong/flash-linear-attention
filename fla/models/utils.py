@@ -309,7 +309,6 @@ class VisionEmbeddings(nn.Module):
         if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
             return self.position_embeddings
 
-        class_pos_embed = self.position_embeddings[:, :1]
         patch_pos_embed = self.position_embeddings[:, 1:]
 
         dim = embeddings.shape[-1]
@@ -330,7 +329,7 @@ class VisionEmbeddings(nn.Module):
 
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
 
-        return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
+        return patch_pos_embed
 
     def forward(
         self,
@@ -353,10 +352,13 @@ class VisionEmbeddings(nn.Module):
         if interpolate_pos_encoding:
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
         else:
+            print(f"embeddings shape {embeddings.shape}")
+            print(f"position_embeddings shape {self.position_embeddings.shape}")
             embeddings = embeddings + self.position_embeddings
 
         embeddings = self.dropout(embeddings)
 
+        # print(f"embedding shape {embeddings.shape}")
         return embeddings
 
 

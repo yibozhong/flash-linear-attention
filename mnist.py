@@ -20,7 +20,7 @@ import time
 from transformers import ViTModel, ViTConfig, ViTForImageClassification
 from transformers import AutoModelForImageClassification
 from mambavision import create_model
-device, dtype = torch.device('cuda:0'), torch.bfloat16
+device, dtype = torch.device('cuda'), torch.bfloat16
 import torch.profiler as profiler
 
 def train_with_profiler(model, train_dataloader, criterion, optimizer, device, dtype):
@@ -75,7 +75,7 @@ def eval(model, dataloader):
 # student_config.num_labels = 10
 # student_config.num_hidden_layers = 7 # change to 6 when ps=2
 # student_config.image_size = 224
-# student_config.patch_size = 16
+# student_config.patch_size = 2
 # student_config.hidden_size = 768
 # model = ViTForImageClassification(student_config)
 # model = model.to(device=device, dtype=dtype)
@@ -101,8 +101,10 @@ def eval(model, dataloader):
 # model = DeltaNetForImageClassification(config).to(device=device, dtype=dtype)
 
 # gla
-config = GLAConfig(vision=True, class_size=10, image_size=224, patch_size=16, hidden_size=768, hidden_act='silu', num_hidden_layers=7, fuse_cross_entropy=False, attn_mode='fused_recurrent', num_heads=12)
+config = GLAConfig(vision=True, class_size=100, image_size=14, patch_size=16, hidden_size=768, hidden_act='relu', num_hidden_layers=4, fuse_cross_entropy=False, attn_mode='fused_chunk', num_heads=12)
+config.conv = True
 model = GLAForImageClassification(config).to(device=device, dtype=dtype)
+
 
 # gsa
 # config = GSAConfig(vision=True, class_size=10, image_size=224, patch_size=16, hidden_size=736, hidden_act='silu', num_hidden_layers=7, fuse_cross_entropy=False, attn_mode='fused_chunk', num_heads=8)
@@ -126,38 +128,42 @@ model = GLAForImageClassification(config).to(device=device, dtype=dtype)
 # model.load_state_dict(torch.load('gsa_cifar100_sft_res32_ps1_30epoch_with_aug_layer15_hs336_22M_params.pth'))
 
 transform = transforms.Compose([
-    transforms.Resize((224, 224)), 
+    transforms.Resize((227, 227)), 
     transforms.ToTensor(), 
 ])
 
-train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-train_dataloader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
+train_dataloader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=8)
 
-test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-test_dataloader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+test_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
+test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=8)
 
 model.requires_grad_(True)
 model.train()
-
+conv_param = 0
 # print trainble parameters
 for name, param in model.named_parameters():
     if param.requires_grad:
         # print(name)
-        pass
+        if 'conv' in name or 'embed' in name:
+            print(name)
+            print(param.numel())
+            conv_param += param.numel()
+print(f"conv parameters count: {conv_param}")
 print(f"trainable parameters count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
 criterion = torch.nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=3e-3)
+optimizer = optim.AdamW(model.parameters(), lr=3e-4)
 best_acc = 0
 best_acc_epoch = 0
 time1 = time.time()
-for epoch in range(0):
+for epoch in range(100):
     model.train()
     for i, data in enumerate(tqdm(train_dataloader)):
         x, y = data # x: (batch_size, 3, 224, 224), y: (batch_size,)
         # print(x.shape)
         x = x.to(device=device, dtype=dtype)
-        y = y.to(device=device, dtype=torch.long)
+        y = y.to(device=device)
         y_pred = model(x).logits
         # y_pred = model(x)
         loss = criterion(y_pred, y)
@@ -168,22 +174,21 @@ for epoch in range(0):
         # if i % 100 == 0:
         print('Epoch: {}, Iteration: {}, Loss: {}'.format(epoch, i, loss.item()))
 
-    # test the model
-    # acc = eval(model, test_dataloader)
-    # if acc > best_acc:
-    #     best_acc = acc
-    #     best_acc_epoch = epoch + 1
-    #     # torch.save(model.state_dict(), f"dtnet_cifar100_sft_res224_ps8_30epoch_with_aug_layer15_hs336_22M_params.pth")
-    # print('Accuracy of the model on the test images: {} %'.format(100 * acc))
+    acc = eval(model, test_dataloader)
+    if acc > best_acc:
+        best_acc = acc
+        best_acc_epoch = epoch + 1
+        torch.save(model.state_dict(), f"convgla_cifar100_sft.pth")
+    print('Accuracy of the model on the test images: {} %'.format(100 * acc))
 
 print(f"Best Accuracy: {best_acc}")
 print(f"Best Accuracy Epoch: {best_acc_epoch}")
 
-train_with_profiler(model, train_dataloader, criterion, optimizer, device, dtype)
+# train_with_profiler(model, train_dataloader, criterion, optimizer, device, dtype)
 
-# model.requires_grad_(False)
-# model.eval()
-# acc = eval(model, test_dataloader)
+model.requires_grad_(False)
+model.eval()
+acc = eval(model, test_dataloader)
 time2 = time.time()
 # time in minutes
 print(f"training time : {(time2 - time1) / 60.0} minutes")
