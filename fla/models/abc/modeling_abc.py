@@ -11,7 +11,8 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (BaseModelOutputWithPast,
-                                           CausalLMOutputWithPast)
+                                           CausalLMOutputWithPast,
+                                           ImageClassifierOutput)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
@@ -19,8 +20,10 @@ from fla.layers.abc import ABCAttention
 from fla.models.abc.configuration_abc import ABCConfig
 from fla.models.utils import Cache
 from fla.modules import (FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss,
-                         RMSNorm)
+                         RMSNorm, LayerNorm)
 from fla.modules.activations import swiglu_linear
+from typing import List, Optional, Tuple, Union, OrderedDict
+from fla.models.utils import Permute, VisionEmbeddings, PatchEmbeddings, Mean
 
 logger = logging.get_logger(__name__)
 
@@ -61,8 +64,10 @@ class ABCBlock(nn.Module):
     def __init__(self, config: ABCConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        if not config.vision:
+            self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        else:
+            self.attn_norm = LayerNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
         self.attn = ABCAttention(
             hidden_size=config.hidden_size,
             expand_k=config.expand_k,
@@ -79,7 +84,10 @@ class ABCBlock(nn.Module):
             fuse_norm=config.fuse_norm,
             layer_idx=layer_idx
         )
-        self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        if not config.vision:
+            self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        else:
+            self.mlp_norm = LayerNorm(hidden_size=config.hidden_size, eps=config.norm_eps, bias=False)
         self.mlp = ABCMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
@@ -165,10 +173,15 @@ class ABCModel(ABCPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
-        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        if not config.vision:
+            self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        else:
+            self.embeddings = VisionEmbeddings(config)
         self.layers = nn.ModuleList([ABCBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        if not config.vision:
+            self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        else:
+            self.norm = LayerNorm(config.hidden_size, eps=config.norm_eps)
 
         self.gradient_checkpointing = False
 
@@ -396,6 +409,139 @@ class ABCForCausalLM(ABCPreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+class ABCForImageClassification(ABCPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = ABCModel(config)
+        self.vm_head = nn.Sequential(OrderedDict(
+            mean=Mean(),
+            head=nn.Linear(config.hidden_size, config.class_size),
+        ))
+        # self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # self.output_activations = nn.Tanh() # follow vit implementation
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embeddings
+
+    def set_input_embeddings(self, value):
+        self.model.embeddings = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    def generate(self, *args, **kwargs):
+        try:
+            return super().generate(*args, **kwargs)
+        except AttributeError as exception:
+            if 'past_key_values' in str(exception):
+                raise AttributeError(
+                    f"You tried to call `generate` with a decoding strategy that manipulates `past_key_values`, "
+                    f"which is not supported for {self.__class__.__name__}. "
+                    f"Try another generation strategy instead. "
+                    f"For the available generation strategies, check this doc: "
+                    f"https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
+                )
+            else:
+                raise exception
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor = None,
+        past_key_values: Optional[Tuple[List[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs
+    ):
+        # only last token for `inputs_ids` if the `past_key_values` is passed along.
+        if past_key_values is not None:
+            if not isinstance(past_key_values, Cache):
+                past_key_values = Cache.from_legacy_cache(past_key_values, input_ids.shape[1] - 1)
+            input_ids = input_ids[:, -1:]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {'inputs_embeds': inputs_embeds}
+        else:
+            model_inputs = {'input_ids': input_ids}
+        model_inputs['past_key_values'] = past_key_values
+        return model_inputs
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[List[torch.Tensor]]] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+
+        hidden_states = outputs[0]
+        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
+        logits = None if fuse_linear_and_cross_entropy else self.vm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            if self.config.fuse_cross_entropy:
+                if fuse_linear_and_cross_entropy:
+                    loss_fct = FusedLinearCrossEntropyLoss()
+                else:
+                    loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
+            else:
+                loss_fct = nn.CrossEntropyLoss()
+            # Enable model parallelism
+            labels = labels.to(hidden_states.device)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
+            if fuse_linear_and_cross_entropy:
+                loss = loss_fct(hidden_states.view(-1, self.config.hidden_size),
+                                labels.view(-1),
+                                self.lm_head.weight,
+                                self.lm_head.bias)
+            else:
+                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return ImageClassifierOutput(
+            loss=loss,
+            logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

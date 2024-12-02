@@ -54,7 +54,7 @@ class ABCAttention(nn.Module):
         self.value_dim = int(self.hidden_size * self.expand_v)
         self.head_k_dim = self.key_dim // self.num_heads
         self.head_v_dim = self.value_dim // self.num_heads
-
+        self.use_rope = False
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.conv_bias = conv_bias

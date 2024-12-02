@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from fla.models.abc import ABCConfig, ABCForCausalLM, ABCModel
+from fla.models.abc import ABCConfig, ABCForCausalLM, ABCModel, ABCForImageClassification
 from fla.models.delta_net import (DeltaNetConfig, DeltaNetForCausalLM, DeltaNetForImageClassification,
                                   DeltaNetModel)
 from fla.models.gla import GLAConfig, GLAForCausalLM, GLAModel, GLAForImageClassification
@@ -20,7 +20,7 @@ from fla.models.transformer import (TransformerConfig, TransformerForCausalLM,
                                     TransformerModel)
 
 __all__ = [
-    'ABCConfig', 'ABCForCausalLM', 'ABCModel',
+    'ABCConfig', 'ABCForCausalLM', 'ABCModel', 'ABCForImageClassification',
     'DeltaNetConfig', 'DeltaNetForCausalLM', 'DeltaNetModel',
     'GLAConfig', 'GLAForCausalLM', 'GLAModel',
     'GSAConfig', 'GSAForCausalLM', 'GSAModel',

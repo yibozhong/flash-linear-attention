@@ -352,8 +352,8 @@ class VisionEmbeddings(nn.Module):
         if interpolate_pos_encoding:
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
         else:
-            print(f"embeddings shape {embeddings.shape}")
-            print(f"position_embeddings shape {self.position_embeddings.shape}")
+            # print(f"embeddings shape {embeddings.shape}")
+            # print(f"position_embeddings shape {self.position_embeddings.shape}")
             embeddings = embeddings + self.position_embeddings
 
         embeddings = self.dropout(embeddings)

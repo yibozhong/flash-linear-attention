@@ -38,6 +38,12 @@ class ABCConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         fuse_norm: bool = True,
         fuse_cross_entropy: bool = True,
+        vision: bool = False,
+        class_size: int = 100,
+        image_size: int = 224,
+        patch_size: int = 16,
+        num_channels: int = 3,
+        hidden_dropout_prob: float = 0.1,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -62,6 +68,12 @@ class ABCConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.fuse_cross_entropy = fuse_cross_entropy
         self.fuse_norm = fuse_norm
+        self.vision = vision
+        self.class_size = class_size
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.hidden_dropout_prob = hidden_dropout_prob
 
         super().__init__(
             pad_token_id=pad_token_id,
